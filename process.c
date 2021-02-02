@@ -7,7 +7,6 @@
 #include <string.h>
 #include "userprog/gdt.h"
 #include "userprog/pagedir.h"
-#include "userprog/syscall.h"
 #include "userprog/tss.h"
 #include "filesys/directory.h"
 #include "filesys/file.h"
@@ -16,17 +15,15 @@
 #include "threads/init.h"
 #include "threads/interrupt.h"
 #include "threads/palloc.h"
+#include "threads/synch.h"
 #include "threads/thread.h"
 #include "threads/vaddr.h"
 
-
 # define WORD_SIZE 4
 
-
+static struct semaphore temporary;
 static thread_func start_process NO_RETURN;
 static bool load (const char *cmdline, void (**eip) (void), void **esp);
-
-extern struct list all_list;
 
 /* Starts a new thread running a user program loaded from
    FILENAME.  The new thread may be scheduled (and may even exit)
@@ -148,53 +145,26 @@ process_wait (tid_t child_tid)
 void
 process_exit (void)
 {
-  struct thread *current_thread = thread_current();
+  struct thread *cur = thread_current ();
   uint32_t *pd;
-
-  int exit_status = current_thread->exit_status;
-  if (exit_status == INIT_EXIT_STAT)
-    exit_process(-1);
-
-
-  printf("%s: exit(%d)\n",current_thread->name,exit_status);
-
-  if (lock_held_by_current_thread(&filesys_lock))
-  {
-    //printf("release_filesys_lock\n"); // for debug.
-    lock_release(&filesys_lock);
-  }
-
-  // enum intr_level old_level = intr_disable();
-  lock_acquire(&filesys_lock);
-  clean_all_files(&current_thread->opened_files);
-  file_close(current_thread->self);
-  struct list_elem *elem_pop;
-  while(!list_empty(&thread_current()->children_list))
-  {
-    elem_pop = list_pop_front(&thread_current()->children_list);
-    struct process_file *f = list_entry (elem_pop, struct child_process, child_elem);
-    free(f);
-  }
-  lock_release(&filesys_lock);
-  // intr_set_level(old_level);
-  // printf("closed all\n");
 
   /* Destroy the current process's page directory and switch back
      to the kernel-only page directory. */
-  pd = current_thread->pagedir;
+  pd = cur->pagedir;
   if (pd != NULL)
     {
       /* Correct ordering here is crucial.  We must set
-         current_thread->pagedir to NULL before switching page directories,
+         cur->pagedir to NULL before switching page directories,
          so that a timer interrupt can't switch back to the
          process page directory.  We must activate the base page
          directory before destroying the process's page
          directory, or our active page directory will be one
          that's been freed (and cleared). */
-      current_thread->pagedir = NULL;
+      cur->pagedir = NULL;
       pagedir_activate (NULL);
       pagedir_destroy (pd);
     }
+  sema_up (&temporary);
 }
 
 /* Sets up the CPU for running user code in the current
@@ -452,7 +422,6 @@ validate_segment (const struct Elf32_Phdr *phdr, struct file *file)
 
   /* It's okay. */
   return true;
-
 }
 
 /* Loads a segment starting at offset OFS in FILE at address
