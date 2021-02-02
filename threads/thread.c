@@ -13,6 +13,7 @@
 #include "threads/vaddr.h"
 #ifdef USERPROG
 #include "userprog/process.h"
+#include "userprog/syscall.h"
 #endif
 
 /* Random value for struct thread's `magic' member.
@@ -26,7 +27,7 @@ static struct list ready_list;
 
 /* List of all processes.  Processes are added to this list
    when they are first scheduled and removed when they exit. */
-static struct list all_list;
+struct list all_list;
 
 /* Idle thread. */
 static struct thread *idle_thread;
@@ -36,6 +37,8 @@ static struct thread *initial_thread;
 
 /* Lock used by allocate_tid(). */
 static struct lock tid_lock;
+
+//struct lock filesys_lock;
 
 /* Stack frame for kernel_thread(). */
 struct kernel_thread_frame
@@ -93,6 +96,8 @@ thread_init (void)
   list_init (&ready_list);
   list_init (&all_list);
 
+  lock_init(&filesys_lock);
+
   /* Set up a thread structure for the running thread. */
   initial_thread = running_thread ();
   init_thread (initial_thread, "main", PRI_DEFAULT);
@@ -115,6 +120,7 @@ thread_start (void)
 
   /* Wait for the idle thread to initialize idle_thread. */
   sema_down (&idle_started);
+
 }
 
 /* Called by the timer interrupt handler at each timer tick.
@@ -171,6 +177,7 @@ thread_create (const char *name, int priority,
   struct switch_entry_frame *ef;
   struct switch_threads_frame *sf;
   tid_t tid;
+  enum intr_level old_level;
 
   ASSERT (function != NULL);
 
@@ -182,6 +189,17 @@ thread_create (const char *name, int priority,
   /* Initialize thread. */
   init_thread (t, name, priority);
   tid = t->tid = allocate_tid ();
+  struct child_process* c = malloc(sizeof(*c));
+  c->tid = tid;
+  c->exit_status = t->exit_status;
+  c->if_waited = false;
+  sema_init (&(c->wait_sema), 0);
+  list_push_back (&running_thread()->children_list, &c->child_elem);
+
+  /* Prepare thread for first run by initializing its stack.
+     Do this atomically so intermediate values for the 'stack'
+     member cannot be observed. */
+  old_level = intr_disable ();
 
   /* Stack frame for kernel_thread(). */
   kf = alloc_frame (t, sizeof *kf);
@@ -197,6 +215,8 @@ thread_create (const char *name, int priority,
   sf = alloc_frame (t, sizeof *sf);
   sf->eip = switch_entry;
   sf->ebp = 0;
+
+  intr_set_level (old_level);
 
   /* Add to run queue. */
   thread_unblock (t);
@@ -281,14 +301,23 @@ void
 thread_exit (void)
 {
   ASSERT (!intr_context ());
+  enum intr_level old_level = intr_disable();
+  if (thread_current()->parent->waiting_child != NULL)
+  {
+    if (thread_current()->parent->waiting_child->tid == thread_current()->tid)
+      sema_up(&thread_current()->parent->waiting_child->wait_sema);
+  }
+  intr_set_level(old_level);
 
 #ifdef USERPROG
   process_exit ();
+  // printf("done USERPROG\n");
 #endif
 
   /* Remove thread from all threads list, set our status to dying,
      and schedule another process.  That process will destroy us
      when it calls thread_schedule_tail(). */
+
   intr_disable ();
   list_remove (&thread_current()->allelem);
   thread_current ()->status = THREAD_DYING;
@@ -451,8 +480,6 @@ is_thread (struct thread *t)
 static void
 init_thread (struct thread *t, const char *name, int priority)
 {
-  enum intr_level old_level;
-
   ASSERT (t != NULL);
   ASSERT (PRI_MIN <= priority && priority <= PRI_MAX);
   ASSERT (name != NULL);
@@ -463,10 +490,15 @@ init_thread (struct thread *t, const char *name, int priority)
   t->stack = (uint8_t *) t + PGSIZE;
   t->priority = priority;
   t->magic = THREAD_MAGIC;
-
-  old_level = intr_disable ();
+  list_init (&t->children_list);
+  t->parent = running_thread();
+  list_init (&t->opened_files);
+  t->fd_count=2;
+  t->exit_status = INIT_EXIT_STAT;
+  sema_init(&t->load_sema,0);
+  t->waiting_child=NULL;
+  t->self=NULL;
   list_push_back (&all_list, &t->allelem);
-  intr_set_level (old_level);
 }
 
 /* Allocates a SIZE-byte frame at the top of thread T's stack and
@@ -565,6 +597,7 @@ schedule (void)
   thread_schedule_tail (prev);
 }
 
+
 /* Returns a tid to use for a new thread. */
 static tid_t
 allocate_tid (void)
@@ -580,5 +613,34 @@ allocate_tid (void)
 }
 
 /* Offset of `stack' member within `struct thread'.
-   Used by switch.S, which can't figure it out on its own. */
+   if_waited by switch.S, which can't figure it out on its own. */
 uint32_t thread_stack_ofs = offsetof (struct thread, stack);
+
+bool
+cmp_waketick(struct list_elem *first, struct list_elem *second, void *aux)
+{
+  struct thread *fthread = list_entry (first, struct thread, elem);
+  struct thread *sthread = list_entry (second, struct thread, elem);
+
+  return fthread->waketick < sthread->waketick;
+
+}
+
+struct list_elem *
+find_child_proc(tid_t child_tid)
+{
+  ASSERT (intr_get_level () == INTR_OFF);
+
+  struct list_elem *tmp_e;
+
+  for (tmp_e = list_begin (&thread_current()->children_list); tmp_e != list_end (&thread_current()->children_list);
+          tmp_e = list_next (tmp_e))
+      {
+        struct child_process *f = list_entry (tmp_e, struct child_process, child_elem);
+        if(f->tid == child_tid)
+        {
+          return tmp_e;
+        }
+      }
+  return NULL;
+}
